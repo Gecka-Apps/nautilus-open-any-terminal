@@ -17,9 +17,20 @@
       <description></description>
     </key>
     <key name="terminal" type="s">
-      <default>'gnome-terminal'</default>
-      <summary>Terminal used in Nautilus for Open Here extension</summary>
-      <description></description>
+      <default>''</default>
+      <summary>Deprecated: use 'terminals' instead. Kept for one-time migration.</summary>
+      <description>
+        If non-empty, this value is migrated to the 'terminals' key on first load and then cleared.
+      </description>
+    </key>
+    <key name="terminals" type="as">
+      <default>['gnome-terminal']</default>
+      <summary>List of terminals to expose in the Nautilus context menu</summary>
+      <description>
+        Each entry is a terminal id (e.g. 'ghostty', 'guake', 'gnome-terminal').
+        One menu entry is generated per terminal, in the given order.
+        The first entry is considered the primary terminal used by the keyboard shortcut.
+      </description>
     </key>
     <key name="custom-local-command" type="s">
       <default>""</default>

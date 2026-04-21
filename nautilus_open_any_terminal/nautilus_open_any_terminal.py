@@ -144,18 +144,26 @@ TERMINALS = {
 
 FLATPAK_PARMS = ["off", "system", "user"]
 
-terminal = "gnome-terminal"
-terminal_cmd: list[str] = None  # type: ignore
-terminal_data: Terminal = TERMINALS["gnome-terminal"]
+@dataclass
+class TerminalConfig:
+    """A resolved terminal entry: the terminal id, its static definition, and its launch command prefix."""
+
+    terminal: str
+    data: Terminal
+    cmd: list[str]
+
+
+terminal_configs: list[TerminalConfig] = []
 new_tab = False
 flatpak = FLATPAK_PARMS[0]
-custom_local_command: str
-custom_remote_command: str
+custom_local_command: str = ""
+custom_remote_command: str = ""
 
 GSETTINGS_PATH = "com.github.stunkymonkey.nautilus-open-any-terminal"
 GSETTINGS_KEYBINDINGS = "keybindings"
 GSETTINGS_BIND_REMOTE = "bind-remote"
 GSETTINGS_TERMINAL = "terminal"
+GSETTINGS_TERMINALS = "terminals"
 GSETTINGS_NEW_TAB = "new-tab"
 GSETTINGS_FLATPAK = "flatpak"
 GSETTINGS_USE_GENERIC_TERMINAL_NAME = "use-generic-terminal-name"
@@ -208,18 +216,18 @@ def parse_custom_command(command: str, data: str | list[str]) -> list[str]:
     return shlex.split(command.replace("%s", shlex.join(data)))
 
 
-def run_command_in_terminal(command: list[str], *, cwd: str | None = None):
-    if terminal == "custom":
+def run_command_in_terminal(config: TerminalConfig, command: list[str], *, cwd: str | None = None):
+    if config.terminal == "custom":
         cmd = parse_custom_command(custom_remote_command, command)
     else:
-        cmd = terminal_cmd.copy()
+        cmd = config.cmd.copy()
         # Remove '--new-window' argument for Ptyxis remote sessions (fixes window size reset)
-        if terminal == "ptyxis" and (command and command[0] == "ssh"):
+        if config.terminal == "ptyxis" and (command and command[0] == "ssh"):
             del cmd[1]
-        if cwd and terminal_data.workdir_arguments:
-            cmd.extend(terminal_data.workdir_arguments)
+        if cwd and config.data.workdir_arguments:
+            cmd.extend(config.data.workdir_arguments)
             cmd.append(cwd)
-        cmd.extend(terminal_data.command_arguments)
+        cmd.extend(config.data.command_arguments)
         cmd.extend(command)
 
     Popen(cmd, cwd=cwd)  # pylint: disable=consider-using-with
@@ -247,12 +255,12 @@ def ssh_command_from_uri(uri: str, *, is_directory: bool):
     return cmd
 
 
-def open_remote_terminal_in_uri(uri: str):
+def open_remote_terminal_in_uri(config: TerminalConfig, uri: str):
     """Open a new remote terminal"""
-    run_command_in_terminal(ssh_command_from_uri(uri, is_directory=True))
+    run_command_in_terminal(config, ssh_command_from_uri(uri, is_directory=True))
 
 
-def open_local_terminal_in_uri(uri: str):
+def open_local_terminal_in_uri(config: TerminalConfig, uri: str):
     """open the new terminal with correct path"""
     result = urlparse(uri)
 
@@ -267,40 +275,48 @@ def open_local_terminal_in_uri(uri: str):
         filename = unquote(result.path)
 
     if result.scheme == "admin":
-        run_command_in_terminal(["sudo", "-s"], cwd=filename)
+        run_command_in_terminal(config, ["sudo", "-s"], cwd=filename)
         return
 
-    if terminal == "warp":
+    if config.terminal == "warp":
         # Force new_tab to be considered even without traditional tab arguments
         Popen(  # pylint: disable=consider-using-with
             ["xdg-open", f"warp://action/new_{'tab' if new_tab else 'window'}?path={result.path}"]
         )
         return
 
-    cmd = terminal_cmd.copy()
-    if terminal == "custom":
+    cmd = config.cmd.copy()
+    if config.terminal == "custom":
         cmd = parse_custom_command(custom_local_command, filename)
-    elif filename and terminal_data.workdir_arguments:
-        cmd.extend(terminal_data.workdir_arguments)
+    elif filename and config.data.workdir_arguments:
+        cmd.extend(config.data.workdir_arguments)
         cmd.append(filename)
 
     Popen(cmd, cwd=filename)  # pylint: disable=consider-using-with
 
 
-def directory_menu_item_id(*, foreground: bool, remote: bool):
-    return f"OpenTerminal::open{'_' if foreground else '_bg_'}{'remote' if remote else 'file'}_item"
+def directory_menu_item_id(*, foreground: bool, remote: bool, terminal_id: str):
+    return (
+        f"OpenTerminal::open{'_' if foreground else '_bg_'}"
+        f"{'remote' if remote else 'file'}_{terminal_id}_item"
+    )
 
 
-def executable_menu_item_id(*, remote: bool):
-    return f"OpenTerminal::execute{'_remote_' if remote else '_file_'}item"
+def executable_menu_item_id(*, remote: bool, terminal_id: str):
+    return f"OpenTerminal::execute{'_remote_' if remote else '_file_'}{terminal_id}_item"
 
 
-def get_directory_menu_items(
-    file: FileManager.FileInfo, callback, *, foreground: bool, terminal_name: str | None = None
+def get_directory_menu_items_for(
+    config: TerminalConfig,
+    file: FileManager.FileInfo,
+    callback,
+    *,
+    foreground: bool,
+    terminal_name: str | None = None,
 ):
     items = []
     remote = file.get_uri_scheme() in REMOTE_URI_SCHEME
-    terminal_name = terminal_name or terminal_data.name
+    terminal_name = terminal_name or config.data.name
 
     if remote:
         if foreground:
@@ -317,11 +333,11 @@ def get_directory_menu_items(
             tip = REMOTE_TIP.format(terminal_name)
 
         item = FileManager.MenuItem(
-            name=directory_menu_item_id(foreground=foreground, remote=True),
+            name=directory_menu_item_id(foreground=foreground, remote=True, terminal_id=config.terminal),
             label=REMOTE_LABEL.format(terminal_name),
             tip=tip,
         )
-        item.connect("activate", callback, file, True)
+        item.connect("activate", callback, file, True, config)
         items.append(item)
     elif foreground:
         LOCAL_LABEL = _("Open in {}")
@@ -331,7 +347,7 @@ def get_directory_menu_items(
         LOCAL_TIP = _("Open {} in This Directory")
 
     # Let wezterm handle opening a local terminal
-    if terminal == "wezterm" and flatpak == "off":
+    if config.terminal == "wezterm" and flatpak == "off":
         return items
 
     if foreground:
@@ -340,19 +356,39 @@ def get_directory_menu_items(
         tip = LOCAL_TIP.format(terminal_name)
 
     item = FileManager.MenuItem(
-        name=directory_menu_item_id(foreground=foreground, remote=False),
+        name=directory_menu_item_id(foreground=foreground, remote=False, terminal_id=config.terminal),
         label=LOCAL_LABEL.format(terminal_name),
         tip=tip,
     )
-    item.connect("activate", callback, file, False)
+    item.connect("activate", callback, file, False, config)
     items.append(item)
     return items
 
 
-def get_executable_menu_items(file: FileManager.FileInfo, callback, *, terminal_name: str | None = None):
+def get_directory_menu_items(
+    file: FileManager.FileInfo, callback, *, foreground: bool, terminal_name: str | None = None
+):
+    """Aggregate directory menu items across all configured terminals."""
+    items = []
+    for config in terminal_configs:
+        items.extend(
+            get_directory_menu_items_for(
+                config, file, callback, foreground=foreground, terminal_name=terminal_name
+            )
+        )
+    return items
+
+
+def get_executable_menu_items_for(
+    config: TerminalConfig,
+    file: FileManager.FileInfo,
+    callback,
+    *,
+    terminal_name: str | None = None,
+):
     items = []
     remote = file.get_uri_scheme() in REMOTE_URI_SCHEME
-    terminal_name = terminal_name or terminal_data.name
+    terminal_name = terminal_name or config.data.name
 
     if remote:
         REMOTE_LABEL = _("Execute in Remote {}")
@@ -362,11 +398,11 @@ def get_executable_menu_items(file: FileManager.FileInfo, callback, *, terminal_
 
         tip = REMOTE_TIP.format(file.get_name(), terminal_name)
         item = FileManager.MenuItem(
-            name=executable_menu_item_id(remote=True),
+            name=executable_menu_item_id(remote=True, terminal_id=config.terminal),
             label=REMOTE_LABEL.format(terminal_name),
             tip=tip,
         )
-        item.connect("activate", callback, file, True)
+        item.connect("activate", callback, file, True, config)
         items.append(item)
     else:
         LOCAL_LABEL = _("Execute in {}")
@@ -374,12 +410,22 @@ def get_executable_menu_items(file: FileManager.FileInfo, callback, *, terminal_
 
     tip = LOCAL_TIP.format(file.get_name(), terminal_name)
     item = FileManager.MenuItem(
-        name=executable_menu_item_id(remote=False),
+        name=executable_menu_item_id(remote=False, terminal_id=config.terminal),
         label=LOCAL_LABEL.format(terminal_name),
         tip=tip,
     )
-    item.connect("activate", callback, file, False)
+    item.connect("activate", callback, file, False, config)
     items.append(item)
+    return items
+
+
+def get_executable_menu_items(file: FileManager.FileInfo, callback, *, terminal_name: str | None = None):
+    """Aggregate executable menu items across all configured terminals."""
+    items = []
+    for config in terminal_configs:
+        items.extend(
+            get_executable_menu_items_for(config, file, callback, terminal_name=terminal_name)
+        )
     return items
 
 
@@ -391,54 +437,78 @@ def is_executable(file: Gio.File) -> bool:
     return attributes.get_attribute_boolean("access::can-execute")
 
 
+def _migrate_legacy_terminal_key():
+    """If the deprecated 'terminal' key is set, push it into 'terminals' and clear it."""
+    legacy = _gsettings.get_string(GSETTINGS_TERMINAL)
+    if not legacy:
+        return
+    current = list(_gsettings.get_strv(GSETTINGS_TERMINALS))
+    if legacy not in current:
+        # Prepend so the previously-selected terminal remains the primary one (for the keybinding).
+        current.insert(0, legacy)
+        _gsettings.set_strv(GSETTINGS_TERMINALS, current)
+    _gsettings.set_string(GSETTINGS_TERMINAL, "")
+    print(f"open-any-terminal: migrated legacy 'terminal=\"{legacy}\"' into 'terminals'")
+
+
+def _build_terminal_config(terminal_id: str, *, new_tab_pref: bool) -> TerminalConfig | None:
+    """Resolve a single terminal id into a runnable TerminalConfig, or return None if unknown."""
+    data = TERMINALS.get(terminal_id)
+    if not data:
+        print(f'open-any-terminal: unknown terminal "{terminal_id}"')
+        return None
+
+    if flatpak != FLATPAK_PARMS[0] and data.flatpak_package is not None:
+        cmd = ["flatpak", "run", "--" + flatpak, data.flatpak_package]
+    else:
+        cmd = [terminal_id]
+        if terminal_id == "blackbox" and "fedora" in distro_id():
+            cmd[0] = "blackbox-terminal"
+
+    if terminal_id == "custom":
+        cmd = []
+    elif new_tab_pref and data.new_tab_arguments:
+        cmd.extend(data.new_tab_arguments)
+    elif data.new_window_arguments:
+        cmd.extend(data.new_window_arguments)
+
+    return TerminalConfig(terminal=terminal_id, data=data, cmd=cmd)
+
+
 def set_terminal_args(*_args):
     # pylint: disable=possibly-used-before-assignment
-    """set the terminal_cmd to the correct values"""
+    """Rebuild the list of TerminalConfig from the current GSettings."""
     global new_tab
     global flatpak
-    global terminal_cmd
-    global terminal_data
+    global terminal_configs
     global custom_local_command
     global custom_remote_command
-    value = _gsettings.get_string(GSETTINGS_TERMINAL)
+
+    _migrate_legacy_terminal_key()
+
     newer_tab = _gsettings.get_boolean(GSETTINGS_NEW_TAB)
     flatpak = FLATPAK_PARMS[_gsettings.get_enum(GSETTINGS_FLATPAK)]
-    new_terminal_data = TERMINALS.get(value)
-    if not new_terminal_data:
-        print(f'open-any-terminal: unknown terminal "{value}"')
-        return
+    new_tab = newer_tab
 
-    global terminal
-    terminal = value
-    terminal_data = new_terminal_data
-    if newer_tab and terminal_data.new_tab_arguments:
-        new_tab = newer_tab
-        new_tab_text = "opening in a new tab"
-    else:
-        new_tab_text = "opening a new window"
-    if newer_tab and not terminal_data.new_tab_arguments:
-        new_tab_text += " (terminal does not support tabs)"
-    if flatpak != FLATPAK_PARMS[0] and terminal_data.flatpak_package is not None:
-        terminal_cmd = ["flatpak", "run", "--" + flatpak, terminal_data.flatpak_package]
-        flatpak_text = f"with flatpak as {flatpak}"
-    else:
-        terminal_cmd = [terminal]
-        if terminal == "blackbox" and "fedora" in distro_id():
-            # It's called like this on fedora
-            terminal_cmd[0] = "blackbox-terminal"
-        flatpak = FLATPAK_PARMS[0]
-        flatpak_text = ""
+    custom_local_command = _gsettings.get_string(GSETTINGS_CUSTOM_LOCAL_COMMAND)
+    custom_remote_command = _gsettings.get_string(GSETTINGS_CUSTOM_REMOTE_COMMAND)
 
-    if terminal == "custom":
-        terminal_cmd = []
-        custom_local_command = _gsettings.get_string(GSETTINGS_CUSTOM_LOCAL_COMMAND)
-        custom_remote_command = _gsettings.get_string(GSETTINGS_CUSTOM_REMOTE_COMMAND)
-    elif new_tab and terminal_data.new_tab_arguments:
-        terminal_cmd.extend(terminal_data.new_tab_arguments)
-    elif terminal_data.new_window_arguments:
-        terminal_cmd.extend(terminal_data.new_window_arguments)
+    terminal_ids = list(_gsettings.get_strv(GSETTINGS_TERMINALS))
+    if not terminal_ids:
+        terminal_ids = ["gnome-terminal"]
 
-    print(f'open-any-terminal: terminal is set to "{terminal}" {new_tab_text} {flatpak_text}')
+    configs: list[TerminalConfig] = []
+    for terminal_id in terminal_ids:
+        config = _build_terminal_config(terminal_id, new_tab_pref=newer_tab)
+        if config is not None:
+            configs.append(config)
+
+    terminal_configs = configs
+
+    summary = ", ".join(c.terminal for c in terminal_configs) or "<none>"
+    flatpak_text = f"flatpak={flatpak}" if flatpak != FLATPAK_PARMS[0] else ""
+    tab_text = "new tab" if newer_tab else "new window"
+    print(f"open-any-terminal: terminals={summary} ({tab_text}) {flatpak_text}")
 
 
 if API_VERSION == "4.0":
@@ -468,11 +538,14 @@ if API_VERSION == "4.0":
             return []
 
         def _open_terminal(self, *_args):
-            """Open the terminal at the specified URI."""
+            """Open the primary terminal (first entry in the list) at the specified URI."""
+            if not terminal_configs:
+                return
+            primary = terminal_configs[0]
             if self._gsettings.get_boolean(GSETTINGS_BIND_REMOTE):
-                open_remote_terminal_in_uri(self.previous_cwd)
+                open_remote_terminal_in_uri(primary, self.previous_cwd)
             else:
-                open_local_terminal_in_uri(self.previous_cwd)
+                open_local_terminal_in_uri(primary, self.previous_cwd)
 
         def _setup_keybindings(self):
             """Set up custom keybindings for the extension."""
@@ -537,10 +610,13 @@ elif API_VERSION in ("3.0", "2.0"):
                 self._create_accel_group()
 
         def _open_terminal(self, *_args):
+            if not terminal_configs:
+                return
+            primary = terminal_configs[0]
             if _gsettings.get_boolean(GSETTINGS_BIND_REMOTE):
-                open_local_terminal_in_uri(self._uri)
+                open_local_terminal_in_uri(primary, self._uri)
             else:
-                open_remote_terminal_in_uri(self._uri)
+                open_remote_terminal_in_uri(primary, self._uri)
 
         def get_widget(self, uri, window):
             """follows uri and sets the correct window"""
@@ -566,17 +642,17 @@ class OpenAnyTerminalExtension(GObject.GObject, FileManager.MenuProvider):
             return _("Terminal")
         return None
 
-    def _menu_dir_activate_cb(self, menu, file_, remote: bool):
+    def _menu_dir_activate_cb(self, menu, file_, remote: bool, config: TerminalConfig):
         if remote:
-            open_remote_terminal_in_uri(file_.get_uri())
+            open_remote_terminal_in_uri(config, file_.get_uri())
         else:
             if file_.get_uri_scheme() == "smb":
                 file_uri = "file://" + quote(file_.get_location().get_path())
             else:
                 file_uri = file_.get_uri()
-            open_local_terminal_in_uri(file_uri)
+            open_local_terminal_in_uri(config, file_uri)
 
-    def _menu_exe_activate_cb(self, menu, file_, remote: bool):
+    def _menu_exe_activate_cb(self, menu, file_, remote: bool, config: TerminalConfig):
         if remote:
             cmd = ssh_command_from_uri(file_.get_uri(), is_directory=False)
         else:
@@ -585,11 +661,11 @@ class OpenAnyTerminalExtension(GObject.GObject, FileManager.MenuProvider):
 
             if result.scheme == "admin":
                 cmd = ["sudo", file]
-            elif terminal in ["xterm", "uxterm"]:
+            elif config.terminal in ["xterm", "uxterm"]:
                 cmd = [f"exec {shlex.quote(file)}"]
             else:
                 cmd = [file]
-        run_command_in_terminal(cmd)
+        run_command_in_terminal(config, cmd)
 
     def get_file_items(self, *args):
         """Generates a list of menu items for a file or folder in the Nautilus file manager."""
